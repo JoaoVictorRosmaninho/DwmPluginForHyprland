@@ -979,19 +979,20 @@ void CHyprDwmLayout::switchWindows(PHLWINDOW pWindow, PHLWINDOW pWindow2) {
         MASTER_NODE->isMaster = false;
         STACK_NODE->isMaster  = true;
         
-        // Reorder in list: new master should be first, old master should be second (first stack)
-        const auto MASTER_IT = std::find(m_masterNodesData.begin(), m_masterNodesData.end(), *MASTER_NODE);
-        const auto STACK_IT  = std::find(m_masterNodesData.begin(), m_masterNodesData.end(), *STACK_NODE);
+        // Use splice to safely reorder nodes without invalidating iterators
+        auto MASTER_IT = std::find(m_masterNodesData.begin(), m_masterNodesData.end(), *MASTER_NODE);
+        auto STACK_IT  = std::find(m_masterNodesData.begin(), m_masterNodesData.end(), *STACK_NODE);
         
-        // Remove both from list
-        m_masterNodesData.erase(MASTER_IT);
-        m_masterNodesData.erase(std::find(m_masterNodesData.begin(), m_masterNodesData.end(), *STACK_NODE));
+        // Move STACK_NODE to the front (becomes new master)
+        m_masterNodesData.splice(m_masterNodesData.begin(), m_masterNodesData, STACK_IT);
         
-        // Add new master first, then old master as first stack
-        m_masterNodesData.push_front(*STACK_NODE);
-        auto it = m_masterNodesData.begin();
-        ++it;
-        m_masterNodesData.insert(it, *MASTER_NODE);
+        // Re-find MASTER_IT since list was modified
+        MASTER_IT = std::find(m_masterNodesData.begin(), m_masterNodesData.end(), *MASTER_NODE);
+        
+        // Move MASTER_NODE to second position (first stack position)
+        auto insertPos = m_masterNodesData.begin();
+        ++insertPos;
+        m_masterNodesData.splice(insertPos, m_masterNodesData, MASTER_IT);
     } else {
         // Simple swap for same type or when only 2 windows
         PNODE->pWindow  = pWindow2;

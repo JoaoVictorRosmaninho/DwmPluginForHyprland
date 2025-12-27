@@ -1,7 +1,0 @@
-/home/joao/void-packages/masterdir-x86_64/builddir/hyprland-0.49.0/DwmPlugin/build/CMakeFiles/hyprfocus.dir
-/home/joao/void-packages/masterdir-x86_64/builddir/hyprland-0.49.0/DwmPlugin/build/CMakeFiles/edit_cache.dir
-/home/joao/void-packages/masterdir-x86_64/builddir/hyprland-0.49.0/DwmPlugin/build/CMakeFiles/rebuild_cache.dir
-/home/joao/void-packages/masterdir-x86_64/builddir/hyprland-0.49.0/DwmPlugin/build/CMakeFiles/list_install_components.dir
-/home/joao/void-packages/masterdir-x86_64/builddir/hyprland-0.49.0/DwmPlugin/build/CMakeFiles/install.dir
-/home/joao/void-packages/masterdir-x86_64/builddir/hyprland-0.49.0/DwmPlugin/build/CMakeFiles/install/local.dir
-/home/joao/void-packages/masterdir-x86_64/builddir/hyprland-0.49.0/DwmPlugin/build/CMakeFiles/install/strip.dir

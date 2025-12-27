@@ -1,0 +1,760 @@
+#include "DwmLayout.hpp"
+#include <hyprland/src/Compositor.hpp>
+#include <hyprland/src/desktop/Window.hpp>
+#include <hyprland/src/desktop/Workspace.hpp>
+#include <hyprland/src/config/ConfigValue.hpp>
+#include <hyprland/src/config/ConfigDataValues.hpp>
+#include <hyprland/src/render/decorations/CHyprGroupBarDecoration.hpp>
+#include <hyprland/src/managers/input/InputManager.hpp>
+#include <hyprland/src/render/Renderer.hpp>
+#include <hyprland/src/managers/LayoutManager.hpp>
+#include <ranges>
+
+SDwmNodeData* CHyprDwmLayout::getNodeFromWindow(PHLWINDOW pWindow) {
+    for (auto& nd : m_lDwmNodesData) {
+        if (nd.pWindow.lock() == pWindow)
+            return &nd;
+    }
+
+    return nullptr;
+}
+
+int CHyprDwmLayout::getNodesOnWorkspace(const WORKSPACEID& ws) {
+    int no = 0;
+    for (auto& n : m_lDwmNodesData) {
+        if (n.workspaceID == ws)
+            no++;
+    }
+
+    return no;
+}
+
+int CHyprDwmLayout::getMastersOnWorkspace(const WORKSPACEID& ws) {
+    int no = 0;
+    for (auto& n : m_lDwmNodesData) {
+        if (n.workspaceID == ws && n.isMaster)
+            no++;
+    }
+
+    return no;
+}
+
+SDwmWorkspaceData* CHyprDwmLayout::getMasterWorkspaceData(const WORKSPACEID& ws) {
+    for (auto& n : m_lDwmWorkspacesData) {
+        if (n.workspaceID == ws)
+            return &n;
+    }
+
+    //create on the fly if it doesn't exist yet
+    const auto PWORKSPACEDATA   = &m_lDwmWorkspacesData.emplace_back();
+    PWORKSPACEDATA->workspaceID = ws;
+    PWORKSPACEDATA->orientation = DWM_ORIENTATION_LEFT;
+
+    return PWORKSPACEDATA;
+}
+
+std::string CHyprDwmLayout::getLayoutName() {
+    return "DWM";
+}
+
+SDwmNodeData* CHyprDwmLayout::getMasterNodeOnWorkspace(const WORKSPACEID& ws) {
+    for (auto& n : m_lDwmNodesData) {
+        if (n.workspaceID == ws && n.isMaster)
+            return &n;
+    }
+
+    return nullptr;
+}
+
+void CHyprDwmLayout::onWindowCreatedTiling(PHLWINDOW pWindow, eDirection direction) {
+    if (pWindow->m_isFloating)
+        return;
+
+    const auto PMONITOR = pWindow->m_monitor.lock();
+    const auto PNODE = &m_lDwmNodesData.emplace_back();
+
+    PNODE->workspaceID = pWindow->workspaceID();
+    PNODE->pWindow     = pWindow;
+
+    const auto WINDOWSONWORKSPACE = getNodesOnWorkspace(PNODE->workspaceID);
+    float      lastSplitPercent   = 0.5f;
+
+    auto OPENINGON = isWindowTiled(g_pCompositor->m_lastWindow.lock()) && g_pCompositor->m_lastWindow.lock()->m_workspace == pWindow->m_workspace ?
+                     getNodeFromWindow(g_pCompositor->m_lastWindow.lock()) :
+                     getMasterNodeOnWorkspace(pWindow->workspaceID());
+
+    // DWM Logic: First window is always master
+    if (WINDOWSONWORKSPACE == 1) {
+        PNODE->isMaster = true;
+        PNODE->percMaster = lastSplitPercent;
+    } else {
+        // All new windows go to stack
+        PNODE->isMaster = false;
+        
+        if (OPENINGON) {
+            lastSplitPercent = OPENINGON->percMaster;
+        }
+        
+        PNODE->percMaster = lastSplitPercent;
+    }
+
+    // recalc
+    recalculateMonitor(pWindow->monitorID());
+}
+
+void CHyprDwmLayout::onWindowRemovedTiling(PHLWINDOW pWindow) {
+    const auto PNODE = getNodeFromWindow(pWindow);
+
+    if (!PNODE)
+        return;
+
+    const auto WORKSPACEID = PNODE->workspaceID;
+
+    pWindow->unsetWindowData(PRIORITY_LAYOUT);
+    pWindow->updateWindowData();
+
+    if (pWindow->isFullscreen())
+        g_pCompositor->setWindowFullscreenInternal(pWindow, FSMODE_NONE);
+
+    const bool WASMASTERNODE = PNODE->isMaster;
+
+    m_lDwmNodesData.remove(*PNODE);
+
+    // If master was removed, promote first stack window to master
+    if (WASMASTERNODE && getNodesOnWorkspace(WORKSPACEID) > 0) {
+        for (auto& nd : m_lDwmNodesData) {
+            if (nd.workspaceID == WORKSPACEID && !nd.isMaster) {
+                nd.isMaster = true;
+                break;
+            }
+        }
+    }
+
+    recalculateMonitor(pWindow->monitorID());
+}
+
+void CHyprDwmLayout::recalculateMonitor(const MONITORID& monid) {
+    const auto PMONITOR = g_pCompositor->getMonitorFromID(monid);
+
+    if (!PMONITOR || !PMONITOR->m_activeWorkspace)
+        return;
+
+    g_pHyprRenderer->damageMonitor(PMONITOR);
+
+    if (PMONITOR->m_activeSpecialWorkspace)
+        calculateWorkspace(PMONITOR->m_activeSpecialWorkspace);
+
+    calculateWorkspace(PMONITOR->m_activeWorkspace);
+}
+
+void CHyprDwmLayout::calculateWorkspace(PHLWORKSPACE pWorkspace) {
+    const auto PMONITOR = pWorkspace->m_monitor.lock();
+
+    if (!PMONITOR)
+        return;
+
+    if (pWorkspace->m_hasFullscreenWindow) {
+        // fullscreen window handling
+        const auto PFULLWINDOW = g_pCompositor->getFullscreenWindowOnWorkspace(pWorkspace->m_id);
+
+        if (pWorkspace->m_efFullscreenMode == FSMODE_FULLSCREEN) {
+            PFULLWINDOW->m_vRealPosition = PMONITOR->vecPosition;
+            PFULLWINDOW->m_vRealSize = PMONITOR->vecSize;
+
+            PFULLWINDOW->updateWindowDecos();
+
+            return;
+        } else if (pWorkspace->m_efFullscreenMode == FSMODE_MAXIMIZED) {
+            SDwindleNodeData fakeNode;
+            fakeNode.pWindow     = PFULLWINDOW;
+            fakeNode.position    = PMONITOR->vecPosition + PMONITOR->vecReservedTopLeft;
+            fakeNode.size        = PMONITOR->vecSize - PMONITOR->vecReservedTopLeft - PMONITOR->vecReservedBottomRight;
+            fakeNode.workspaceID = pWorkspace->m_id;
+            PFULLWINDOW->m_vPosition = fakeNode.position;
+            PFULLWINDOW->m_vSize     = fakeNode.size;
+
+            applyNodeDataToWindow(&fakeNode);
+
+            return;
+        }
+    }
+
+    const auto PMASTERNODE = getMasterNodeOnWorkspace(pWorkspace->m_id);
+
+    if (!PMASTERNODE)
+        return;
+
+    eDwmOrientation orientation = getDynamicOrientation(pWorkspace);
+    
+    const auto MASTERS      = getMastersOnWorkspace(pWorkspace->m_id);
+    const auto WINDOWS      = getNodesOnWorkspace(pWorkspace->m_id);
+    const auto STACKWINDOWS = WINDOWS - MASTERS;
+
+    // Get reserved areas
+    const auto RESERVED = PMONITOR->vecReservedTopLeft + PMONITOR->vecReservedBottomRight;
+
+    // Master percentage from first master node
+    const float PMFACT = PMASTERNODE->percMaster;
+
+    // Calculate gaps
+    static auto GAPSINDATA         = CConfigValue<Hyprlang::CUSTOMTYPE>("general:gaps_in");
+    static auto GAPSOUTDATA        = CConfigValue<Hyprlang::CUSTOMTYPE>("general:gaps_out");
+    auto* const PGAPSIN            = (CCssGapData*)(GAPSINDATA.ptr())->getData();
+    auto* const PGAPSOUT           = (CCssGapData*)(GAPSOUTDATA.ptr())->getData();
+
+    const auto GAPSIN  = Vector2D{PGAPSIN->left + PGAPSIN->right, PGAPSIN->top + PGAPSIN->bottom};
+    const auto GAPSOUT = Vector2D{PGAPSOUT->left + PGAPSOUT->right, PGAPSOUT->top + PGAPSOUT->bottom};
+
+    const bool DISPLAYLEFT   = STICKS(PMONITOR->vecPosition.x, PMONITOR->vecPosition.x + PMONITOR->vecReservedTopLeft.x);
+    const bool DISPLAYTOP    = STICKS(PMONITOR->vecPosition.y, PMONITOR->vecPosition.y + PMONITOR->vecReservedTopLeft.y);
+    const bool DISPLAYRIGHT  = STICKS(PMONITOR->vecPosition.x + PMONITOR->vecSize.x, PMONITOR->vecPosition.x + PMONITOR->vecSize.x - PMONITOR->vecReservedBottomRight.x);
+    const bool DISPLAYBOTTOM = STICKS(PMONITOR->vecPosition.y + PMONITOR->vecSize.y, PMONITOR->vecPosition.y + PMONITOR->vecSize.y - PMONITOR->vecReservedBottomRight.y);
+
+    const auto BORDERSIZE = CConfigValue<Hyprlang::INT>("general:border_size");
+    const auto GAPSIZE = Vector2D{
+        (DISPLAYLEFT ? PGAPSOUT->left : 0) + (DISPLAYRIGHT ? PGAPSOUT->right : 0),
+        (DISPLAYTOP ? PGAPSOUT->top : 0) + (DISPLAYBOTTOM ? PGAPSOUT->bottom : 0)
+    };
+
+    const auto PWORKSPACEDATA = getMasterWorkspaceData(pWorkspace->m_id);
+
+    if (orientation == DWM_ORIENTATION_LEFT || orientation == DWM_ORIENTATION_RIGHT) {
+        // Horizontal split (master on left or right)
+        const auto availableWidth  = PMONITOR->vecSize.x - RESERVED.x - GAPSIZE.x;
+        const auto availableHeight = PMONITOR->vecSize.y - RESERVED.y - GAPSIZE.y;
+
+        const auto masterWidth = STACKWINDOWS > 0 ? availableWidth * PMFACT : availableWidth;
+        const auto stackWidth  = STACKWINDOWS > 0 ? availableWidth * (1.0 - PMFACT) : 0;
+
+        // Position master
+        PMASTERNODE->position = PMONITOR->vecPosition + PMONITOR->vecReservedTopLeft +
+                                Vector2D{orientation == DWM_ORIENTATION_LEFT ? (DISPLAYLEFT ? PGAPSOUT->left : 0) : (DISPLAYLEFT ? PGAPSOUT->left : 0) + stackWidth + PGAPSIN->left,
+                                        DISPLAYTOP ? PGAPSOUT->top : 0};
+        PMASTERNODE->size = Vector2D{masterWidth - (STACKWINDOWS > 0 ? PGAPSIN->left : 0), availableHeight};
+
+        applyNodeDataToWindow(PMASTERNODE);
+
+        // Position stack windows
+        if (STACKWINDOWS > 0) {
+            float stackY = PMONITOR->vecPosition.y + PMONITOR->vecReservedTopLeft.y + (DISPLAYTOP ? PGAPSOUT->top : 0);
+            const float stackHeightPerWindow = availableHeight / STACKWINDOWS;
+
+            for (auto& nd : m_lDwmNodesData) {
+                if (nd.workspaceID != pWorkspace->m_id || nd.isMaster)
+                    continue;
+
+                nd.position = Vector2D{
+                    PMONITOR->vecPosition.x + PMONITOR->vecReservedTopLeft.x +
+                        (orientation == DWM_ORIENTATION_LEFT ? (DISPLAYLEFT ? PGAPSOUT->left : 0) + masterWidth + PGAPSIN->left : (DISPLAYLEFT ? PGAPSOUT->left : 0)),
+                    stackY
+                };
+                nd.size = Vector2D{stackWidth - (DISPLAYRIGHT ? 0 : PGAPSIN->right), stackHeightPerWindow - PGAPSIN->top};
+
+                applyNodeDataToWindow(&nd);
+
+                stackY += stackHeightPerWindow;
+            }
+        }
+    } else {
+        // Vertical split (master on top or bottom)
+        const auto availableWidth  = PMONITOR->vecSize.x - RESERVED.x - GAPSIZE.x;
+        const auto availableHeight = PMONITOR->vecSize.y - RESERVED.y - GAPSIZE.y;
+
+        const auto masterHeight = STACKWINDOWS > 0 ? availableHeight * PMFACT : availableHeight;
+        const auto stackHeight  = STACKWINDOWS > 0 ? availableHeight * (1.0 - PMFACT) : 0;
+
+        // Position master
+        PMASTERNODE->position = PMONITOR->vecPosition + PMONITOR->vecReservedTopLeft +
+                                Vector2D{DISPLAYLEFT ? PGAPSOUT->left : 0,
+                                        orientation == DWM_ORIENTATION_TOP ? (DISPLAYTOP ? PGAPSOUT->top : 0) : (DISPLAYTOP ? PGAPSOUT->top : 0) + stackHeight + PGAPSIN->top};
+        PMASTERNODE->size = Vector2D{availableWidth, masterHeight - (STACKWINDOWS > 0 ? PGAPSIN->top : 0)};
+
+        applyNodeDataToWindow(PMASTERNODE);
+
+        // Position stack windows
+        if (STACKWINDOWS > 0) {
+            float stackX = PMONITOR->vecPosition.x + PMONITOR->vecReservedTopLeft.x + (DISPLAYLEFT ? PGAPSOUT->left : 0);
+            const float stackWidthPerWindow = availableWidth / STACKWINDOWS;
+
+            for (auto& nd : m_lDwmNodesData) {
+                if (nd.workspaceID != pWorkspace->m_id || nd.isMaster)
+                    continue;
+
+                nd.position = Vector2D{
+                    stackX,
+                    PMONITOR->vecPosition.y + PMONITOR->vecReservedTopLeft.y +
+                        (orientation == DWM_ORIENTATION_TOP ? (DISPLAYTOP ? PGAPSOUT->top : 0) + masterHeight + PGAPSIN->top : (DISPLAYTOP ? PGAPSOUT->top : 0))
+                };
+                nd.size = Vector2D{stackWidthPerWindow - PGAPSIN->left, stackHeight - (DISPLAYBOTTOM ? 0 : PGAPSIN->bottom)};
+
+                applyNodeDataToWindow(&nd);
+
+                stackX += stackWidthPerWindow;
+            }
+        }
+    }
+}
+
+void CHyprDwmLayout::applyNodeDataToWindow(SDwmNodeData* pNode) {
+    const auto PWINDOW = pNode->pWindow.lock();
+
+    if (!PWINDOW || !validMapped(PWINDOW))
+        return;
+
+    PWINDOW->m_vSize     = pNode->size;
+    PWINDOW->m_vPosition = pNode->position;
+
+    const auto PMONITOR = PWINDOW->m_monitor.lock();
+
+    if (!PMONITOR)
+        return;
+
+    PWINDOW->updateWindowData();
+
+    static auto PGAPSIN  = CConfigValue<Hyprlang::CUSTOMTYPE>("general:gaps_in");
+    static auto PGAPSOUT = CConfigValue<Hyprlang::CUSTOMTYPE>("general:gaps_out");
+
+    auto* const PGAPSINVAL  = (CCssGapData*)(PGAPSIN.ptr())->getData();
+    auto* const PGAPSOUTVAL = (CCssGapData*)(PGAPSOUT.ptr())->getData();
+
+    const bool DISPLAYLEFT   = STICKS(PWINDOW->m_vPosition.x, PMONITOR->vecPosition.x + PMONITOR->vecReservedTopLeft.x);
+    const bool DISPLAYRIGHT  = STICKS(PWINDOW->m_vPosition.x + PWINDOW->m_vSize.x, PMONITOR->vecPosition.x + PMONITOR->vecSize.x - PMONITOR->vecReservedBottomRight.x);
+    const bool DISPLAYTOP    = STICKS(PWINDOW->m_vPosition.y, PMONITOR->vecPosition.y + PMONITOR->vecReservedTopLeft.y);
+    const bool DISPLAYBOTTOM = STICKS(PWINDOW->m_vPosition.y + PWINDOW->m_vSize.y, PMONITOR->vecPosition.y + PMONITOR->vecSize.y - PMONITOR->vecReservedBottomRight.y);
+
+    const auto OFFSETTOPLEFT = Vector2D{DISPLAYLEFT ? PGAPSOUTVAL->left : PGAPSINVAL->left, DISPLAYTOP ? PGAPSOUTVAL->top : PGAPSINVAL->top};
+
+    const auto OFFSETBOTTOMRIGHT = Vector2D{DISPLAYRIGHT ? PGAPSOUTVAL->right : PGAPSINVAL->right, DISPLAYBOTTOM ? PGAPSOUTVAL->bottom : PGAPSINVAL->bottom};
+
+    PWINDOW->m_vRealPosition = PWINDOW->m_vPosition + OFFSETTOPLEFT;
+    PWINDOW->m_vRealSize     = PWINDOW->m_vSize - OFFSETTOPLEFT - OFFSETBOTTOMRIGHT;
+
+    PWINDOW->updateWindowDecos();
+}
+
+bool CHyprDwmLayout::isWindowTiled(PHLWINDOW pWindow) {
+    return getNodeFromWindow(pWindow) != nullptr;
+}
+
+void CHyprDwmLayout::resizeActiveWindow(const Vector2D& pixResize, eRectCorner corner, PHLWINDOW pWindow) {
+    const auto PWINDOW = pWindow ? pWindow : g_pCompositor->m_pLastWindow.lock();
+
+    if (!validMapped(PWINDOW))
+        return;
+
+    const auto PNODE = getNodeFromWindow(PWINDOW);
+
+    if (!PNODE) {
+        PWINDOW->m_vRealSize = Vector2D{std::max((PWINDOW->m_vRealSize.goal() + pixResize).x, 20.0), std::max((PWINDOW->m_vRealSize.goal() + pixResize).y, 20.0)};
+        PWINDOW->updateWindowData();
+        return;
+    }
+
+    const auto PMONITOR = PWINDOW->m_monitor.lock();
+    eDwmOrientation orientation = getDynamicOrientation(PWINDOW->m_workspace);
+
+    const auto STACKWINDOWS = getNodesOnWorkspace(PWINDOW->workspaceID()) - getMastersOnWorkspace(PWINDOW->workspaceID());
+
+    if (PNODE->isMaster && STACKWINDOWS > 0) {
+        // Resizing master changes split ratio
+        float delta = 0.f;
+
+        switch (orientation) {
+            case DWM_ORIENTATION_LEFT:
+            case DWM_ORIENTATION_RIGHT:
+                delta = pixResize.x / PMONITOR->vecSize.x;
+                break;
+            case DWM_ORIENTATION_TOP:
+            case DWM_ORIENTATION_BOTTOM:
+                delta = pixResize.y / PMONITOR->vecSize.y;
+                break;
+            default:
+                break;
+        }
+
+        if (orientation == DWM_ORIENTATION_RIGHT || orientation == DWM_ORIENTATION_BOTTOM)
+            delta = -delta;
+
+        PNODE->percMaster = std::clamp(PNODE->percMaster + delta, 0.05f, 0.95f);
+
+        // Apply to all nodes on workspace
+        for (auto& nd : m_lDwmNodesData) {
+            if (nd.workspaceID == PNODE->workspaceID)
+                nd.percMaster = PNODE->percMaster;
+        }
+    }
+
+    recalculateMonitor(PMONITOR->m_id);
+}
+
+void CHyprDwmLayout::fullscreenRequestForWindow(PHLWINDOW pWindow, const eFullscreenMode CURRENT_EFFECTIVE_MODE, const eFullscreenMode EFFECTIVE_MODE) {
+    if (!validMapped(pWindow))
+        return;
+
+    if (EFFECTIVE_MODE == FSMODE_NONE) {
+        // remove fullscreen
+        pWindow->m_workspace->m_efFullscreenMode = FSMODE_NONE;
+
+        // Unset FS
+        pWindow->m_bIsFullscreen = false;
+
+        recalculateMonitor(pWindow->monitorID());
+    } else {
+        // set fullscreen
+        pWindow->m_workspace->m_efFullscreenMode = EFFECTIVE_MODE;
+
+        pWindow->m_bIsFullscreen = true;
+
+        recalculateMonitor(pWindow->monitorID());
+    }
+}
+
+void CHyprDwmLayout::recalculateWindow(PHLWINDOW pWindow) {
+    const auto PNODE = getNodeFromWindow(pWindow);
+
+    if (!PNODE)
+        return;
+
+    recalculateMonitor(pWindow->monitorID());
+}
+
+SWindowRenderLayoutHints CHyprDwmLayout::requestRenderHints(PHLWINDOW pWindow) {
+    return {};
+}
+
+void CHyprDwmLayout::swapWindowsWithDwmLogic(PHLWINDOW pWindow, PHLWINDOW pWindow2) {
+    // This is the KEY function that implements DWM swap behavior
+    if (!validMapped(pWindow) || !validMapped(pWindow2) || pWindow == pWindow2)
+        return;
+
+    auto PNODE  = getNodeFromWindow(pWindow);
+    auto PNODE2 = getNodeFromWindow(pWindow2);
+
+    if (!PNODE || !PNODE2 || PNODE->workspaceID != PNODE2->workspaceID)
+        return;
+
+    // DWM Logic: If swapping a stack window with master
+    if (PNODE2->isMaster && !PNODE->isMaster) {
+        // pWindow (stack) should become master
+        // pWindow2 (old master) should become first in stack
+        // All other stack windows shift down
+
+        // First, collect all stack windows before the swap
+        std::vector<SDwmNodeData*> stackNodes;
+        for (auto& nd : m_lDwmNodesData) {
+            if (nd.workspaceID == PNODE->workspaceID && !nd.isMaster && &nd != PNODE) {
+                stackNodes.push_back(&nd);
+            }
+        }
+
+        // Swap master status
+        PNODE->isMaster = true;
+        PNODE2->isMaster = false;
+
+        // Reorder nodes in list: master first, then old master, then rest of stack
+        // We need to reorder them in the list to maintain proper iteration order
+        m_lDwmNodesData.remove(*PNODE);
+        m_lDwmNodesData.remove(*PNODE2);
+
+        // Add new master first
+        m_lDwmNodesData.push_front(*PNODE);
+        
+        // Then add old master (now first stack window)
+        auto it = m_lDwmNodesData.begin();
+        ++it; // Move past the new master
+        m_lDwmNodesData.insert(it, *PNODE2);
+
+    } else if (PNODE->isMaster && !PNODE2->isMaster) {
+        // Reverse case: master swapping with stack
+        PNODE->isMaster = false;
+        PNODE2->isMaster = true;
+
+        m_lDwmNodesData.remove(*PNODE);
+        m_lDwmNodesData.remove(*PNODE2);
+
+        m_lDwmNodesData.push_front(*PNODE2);
+        
+        auto it = m_lDwmNodesData.begin();
+        ++it;
+        m_lDwmNodesData.insert(it, *PNODE);
+
+    } else {
+        // Both are stack windows, simple swap
+        const auto PWINDOW = PNODE->pWindow.lock();
+        PNODE->pWindow = PNODE2->pWindow;
+        PNODE2->pWindow = PWINDOW;
+    }
+
+    recalculateMonitor(pWindow->monitorID());
+}
+
+void CHyprDwmLayout::switchWindows(PHLWINDOW pWindow, PHLWINDOW pWindow2) {
+    // Use DWM-specific swap logic
+    swapWindowsWithDwmLogic(pWindow, pWindow2);
+}
+
+void CHyprDwmLayout::alterSplitRatio(PHLWINDOW pWindow, float ratio, bool exact) {
+    const auto PNODE = getNodeFromWindow(pWindow);
+
+    if (!PNODE)
+        return;
+
+    if (exact)
+        PNODE->percMaster = std::clamp(ratio, 0.05f, 0.95f);
+    else
+        PNODE->percMaster = std::clamp(PNODE->percMaster + ratio, 0.05f, 0.95f);
+
+    // Apply to all nodes on workspace
+    for (auto& nd : m_lDwmNodesData) {
+        if (nd.workspaceID == PNODE->workspaceID)
+            nd.percMaster = PNODE->percMaster;
+    }
+
+    recalculateMonitor(pWindow->monitorID());
+}
+
+PHLWINDOW CHyprDwmLayout::getNextWindow(PHLWINDOW pWindow, bool next, bool loop) {
+    if (!isWindowTiled(pWindow))
+        return nullptr;
+
+    const auto PNODE = getNodeFromWindow(pWindow);
+
+    auto       nodes = m_lDwmNodesData;
+    auto       it    = std::find(nodes.begin(), nodes.end(), *PNODE);
+
+    if (next) {
+        ++it;
+        if (it == nodes.end()) {
+            if (loop)
+                return nodes.front().pWindow.lock();
+            return nullptr;
+        }
+        return it->pWindow.lock();
+    } else {
+        if (it == nodes.begin()) {
+            if (loop)
+                return nodes.back().pWindow.lock();
+            return nullptr;
+        }
+        --it;
+        return it->pWindow.lock();
+    }
+}
+
+std::any CHyprDwmLayout::layoutMessage(SLayoutMessageHeader header, std::string message) {
+    auto switchToWindow = [&](PHLWINDOW PWINDOWTOCHANGETO) {
+        if (!validMapped(PWINDOWTOCHANGETO))
+            return;
+
+        if (PWINDOWTOCHANGETO == header.pWindow)
+            return;
+
+        const auto PNODE = getNodeFromWindow(header.pWindow);
+
+        if (!PNODE)
+            return;
+
+        const auto PWORKSPACEDATA = getMasterWorkspaceData(header.pWindow->workspaceID());
+
+        swapWindowsWithDwmLogic(header.pWindow, PWINDOWTOCHANGETO);
+
+        g_pCompositor->focusWindow(PWINDOWTOCHANGETO);
+    };
+
+    CVarList vars(message, 0, ' ');
+
+    if (vars.size() < 1)
+        return "";
+
+    auto command = vars[0];
+
+    if (command == "swapwithmaster") {
+        const auto PWINDOW = header.pWindow;
+
+        if (!isWindowTiled(PWINDOW))
+            return "";
+
+        const auto PMASTER = getMasterNodeOnWorkspace(PWINDOW->workspaceID());
+
+        if (!PMASTER)
+            return "";
+
+        swapWindowsWithDwmLogic(PWINDOW, PMASTER->pWindow.lock());
+
+        return "";
+    } else if (command == "focusmaster") {
+        const auto PMASTER = getMasterNodeOnWorkspace(header.pWindow->workspaceID());
+
+        if (!PMASTER)
+            return "";
+
+        if (PMASTER->pWindow.lock() != header.pWindow)
+            switchToWindow(PMASTER->pWindow.lock());
+
+        return "";
+    } else if (command == "cyclenext") {
+        const auto PNEXTWINDOW = getNextWindow(header.pWindow, true, true);
+        switchToWindow(PNEXTWINDOW);
+    } else if (command == "cycleprev") {
+        const auto PPREVWINDOW = getNextWindow(header.pWindow, false, true);
+        switchToWindow(PPREVWINDOW);
+    } else if (command == "swapnext") {
+        if (!isWindowTiled(header.pWindow))
+            return "";
+
+        const auto PNEXTWINDOW = getNextWindow(header.pWindow, true, true);
+
+        if (PNEXTWINDOW)
+            swapWindowsWithDwmLogic(header.pWindow, PNEXTWINDOW);
+    } else if (command == "swapprev") {
+        if (!isWindowTiled(header.pWindow))
+            return "";
+
+        const auto PPREVWINDOW = getNextWindow(header.pWindow, false, true);
+
+        if (PPREVWINDOW)
+            swapWindowsWithDwmLogic(header.pWindow, PPREVWINDOW);
+    } else if (command == "addmaster") {
+        const auto PNODE = getNodeFromWindow(header.pWindow);
+
+        if (!PNODE || PNODE->isMaster)
+            return "";
+
+        PNODE->isMaster = true;
+
+        recalculateMonitor(header.pWindow->monitorID());
+    } else if (command == "removemaster") {
+        const auto PNODE = getNodeFromWindow(header.pWindow);
+
+        if (!PNODE || !PNODE->isMaster)
+            return "";
+
+        PNODE->isMaster = false;
+
+        recalculateMonitor(header.pWindow->monitorID());
+    } else if (command == "orientationleft" || command == "orientationtop" || command == "orientationright" ||
+               command == "orientationbottom" || command == "orientationcenter") {
+        const auto PWORKSPACEDATA = getMasterWorkspaceData(header.pWindow->workspaceID());
+
+        if (command == "orientationleft")
+            PWORKSPACEDATA->orientation = DWM_ORIENTATION_LEFT;
+        else if (command == "orientationtop")
+            PWORKSPACEDATA->orientation = DWM_ORIENTATION_TOP;
+        else if (command == "orientationright")
+            PWORKSPACEDATA->orientation = DWM_ORIENTATION_RIGHT;
+        else if (command == "orientationbottom")
+            PWORKSPACEDATA->orientation = DWM_ORIENTATION_BOTTOM;
+        else if (command == "orientationcenter")
+            PWORKSPACEDATA->orientation = DWM_ORIENTATION_CENTER;
+
+        recalculateMonitor(header.pWindow->monitorID());
+    } else if (command == "orientationnext") {
+        runOrientationCycle(header, nullptr, 1);
+    } else if (command == "orientationprev") {
+        runOrientationCycle(header, nullptr, -1);
+    } else if (command == "orientationcycle") {
+        runOrientationCycle(header, &vars, 1);
+    }
+
+    return "";
+}
+
+void CHyprDwmLayout::runOrientationCycle(SLayoutMessageHeader& header, CVarList* vars, int direction) {
+    const auto PWORKSPACEDATA = getMasterWorkspaceData(header.pWindow->workspaceID());
+    std::vector<eDwmOrientation> cycle;
+
+    if (vars != nullptr)
+        buildOrientationCycleVectorFromVars(cycle, *vars);
+    else
+        buildOrientationCycleVectorFromEOperation(cycle);
+
+    const auto PCURRENT = std::find(cycle.begin(), cycle.end(), PWORKSPACEDATA->orientation);
+
+    if (PCURRENT == cycle.end())
+        PWORKSPACEDATA->orientation = cycle[0];
+    else {
+        auto PNEXT = PCURRENT + direction;
+        if (PNEXT >= cycle.end())
+            PNEXT = cycle.begin();
+        else if (PNEXT < cycle.begin())
+            PNEXT = cycle.end() - 1;
+
+        PWORKSPACEDATA->orientation = *PNEXT;
+    }
+
+    recalculateMonitor(header.pWindow->monitorID());
+}
+
+void CHyprDwmLayout::buildOrientationCycleVectorFromEOperation(std::vector<eDwmOrientation>& cycle) {
+    for (int i = DWM_ORIENTATION_LEFT; i <= DWM_ORIENTATION_CENTER; ++i) {
+        cycle.push_back((eDwmOrientation)i);
+    }
+}
+
+void CHyprDwmLayout::buildOrientationCycleVectorFromVars(std::vector<eDwmOrientation>& cycle, CVarList& vars) {
+    for (size_t i = 1; i < vars.size(); ++i) {
+        if (vars[i] == "left")
+            cycle.push_back(DWM_ORIENTATION_LEFT);
+        else if (vars[i] == "top")
+            cycle.push_back(DWM_ORIENTATION_TOP);
+        else if (vars[i] == "right")
+            cycle.push_back(DWM_ORIENTATION_RIGHT);
+        else if (vars[i] == "bottom")
+            cycle.push_back(DWM_ORIENTATION_BOTTOM);
+        else if (vars[i] == "center")
+            cycle.push_back(DWM_ORIENTATION_CENTER);
+    }
+
+    if (cycle.empty())
+        buildOrientationCycleVectorFromEOperation(cycle);
+}
+
+void CHyprDwmLayout::moveWindowTo(PHLWINDOW pWindow, const std::string& dir, bool silent) {
+    if (!isWindowTiled(pWindow))
+        return;
+
+    const auto PNODE = getNodeFromWindow(pWindow);
+
+    if (dir == "l" || dir == "r") {
+        const auto PWINDOWTOCHANGETO = getNextWindow(pWindow, dir == "r", false);
+
+        if (PWINDOWTOCHANGETO) {
+            swapWindowsWithDwmLogic(pWindow, PWINDOWTOCHANGETO);
+            if (!silent)
+                g_pCompositor->focusWindow(pWindow);
+        }
+    }
+}
+
+void CHyprDwmLayout::replaceWindowDataWith(PHLWINDOW from, PHLWINDOW to) {
+    const auto PNODE = getNodeFromWindow(from);
+
+    if (!PNODE)
+        return;
+
+    PNODE->pWindow = to;
+
+    applyNodeDataToWindow(PNODE);
+}
+
+void CHyprDwmLayout::onEnable() {
+    for (auto const& w : g_pCompositor->m_windows) {
+        if (w->m_bIsFloating || !w->m_bIsMapped || w->isHidden())
+            continue;
+
+        onWindowCreatedTiling(w);
+    }
+}
+
+void CHyprDwmLayout::onDisable() {
+    m_lDwmNodesData.clear();
+}
+
+Vector2D CHyprDwmLayout::predictSizeForNewWindowTiled() {
+    return {};
+}
+
+eDwmOrientation CHyprDwmLayout::getDynamicOrientation(PHLWORKSPACE pWorkspace) {
+    const auto PWORKSPACEDATA = getMasterWorkspaceData(pWorkspace->m_id);
+    return PWORKSPACEDATA->orientation;
+}
